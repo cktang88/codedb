@@ -122,15 +122,13 @@ fn handleCall(
         return;
     };
 
-    const args_val = params.get("arguments") orelse {
-        writeError(alloc, stdout, id, -32602, "Missing arguments");
-        return;
-    };
-    if (args_val != .object) {
+    const empty_map = std.json.ObjectMap.init(alloc);
+    var args_holder = params.get("arguments") orelse std.json.Value{ .object = empty_map };
+    if (args_holder != .object) {
         writeError(alloc, stdout, id, -32602, "arguments must be object");
         return;
     }
-    const args = &args_val.object;
+    const args = &args_holder.object;
 
     const tool = std.meta.stringToEnum(Tool, name) orelse {
         writeError(alloc, stdout, id, -32602, "Unknown tool");
@@ -169,7 +167,7 @@ fn dispatch(
         .codedb_word => handleWord(alloc, args, out, explorer),
         .codedb_hot => handleHot(alloc, args, out, store, explorer),
         .codedb_deps => handleDeps(alloc, args, out, explorer),
-        .codedb_read => handleRead(alloc, args, out),
+        .codedb_read => handleRead(alloc, args, out, explorer),
         .codedb_edit => handleEdit(alloc, args, out, store, agents),
         .codedb_changes => handleChanges(alloc, args, out, store),
         .codedb_status => handleStatus(alloc, out, store, explorer),
@@ -192,11 +190,15 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
         return;
     };
-    const outline = explorer.getOutline(path) orelse {
+    var outline = explorer.getOutline(path, alloc) catch {
+        out.appendSlice(alloc, "error: outline retrieval failed") catch {};
+        return;
+    } orelse {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
         return;
     };
+    defer outline.deinit();
     const w = out.writer(alloc);
     w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
         outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
@@ -277,11 +279,14 @@ fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@max(1, n)) else 10;
-    const hot = explorer.getHotFiles(store, limit) catch {
+    const hot = explorer.getHotFiles(store, alloc, limit) catch {
         out.appendSlice(alloc, "error: hot files failed") catch {};
         return;
     };
-    // hot is arena-allocated, don't free
+    defer {
+        for (hot) |path| alloc.free(path);
+        alloc.free(hot);
+    }
 
     const w = out.writer(alloc);
     for (hot, 0..) |path, i| {
@@ -294,11 +299,14 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
         return;
     };
-    const imported_by = explorer.getImportedBy(path) catch {
+    const imported_by = explorer.getImportedBy(path, alloc) catch {
         out.appendSlice(alloc, "error: deps failed") catch {};
         return;
     };
-    // arena-allocated, don't free
+    defer {
+        for (imported_by) |dep| alloc.free(dep);
+        alloc.free(imported_by);
+    }
 
     const w = out.writer(alloc);
     w.print("{s} is imported by:\n", .{path}) catch {};
@@ -311,11 +319,22 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
 }
 
-fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
         return;
     };
+    // Try indexed content first (faster, consistent with indexed view)
+    const cached = explorer.getContent(path, alloc) catch {
+        out.appendSlice(alloc, "error: read failed") catch {};
+        return;
+    };
+    if (cached) |owned_content| {
+        defer alloc.free(owned_content);
+        out.appendSlice(alloc, owned_content) catch {};
+        return;
+    }
+    // Fall back to disk read
     const file = std.fs.cwd().openFile(path, .{}) catch {
         out.appendSlice(alloc, "error: file not found: ") catch {};
         out.appendSlice(alloc, path) catch {};
@@ -356,9 +375,19 @@ fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         .content = content,
     };
     if (range_start != null and range_end != null) {
+        if (range_start.? <= 0 or range_end.? <= 0) {
+            out.appendSlice(alloc, "error: range values must be >= 1") catch {};
+            return;
+        }
         req.range = .{ @intCast(range_start.?), @intCast(range_end.?) };
     }
-    if (after) |a| req.after = @intCast(a);
+    if (after) |a| {
+        if (a < 0) {
+            out.appendSlice(alloc, "error: 'after' must be positive") catch {};
+            return;
+        }
+        req.after = @intCast(a);
+    }
 
     const result = edit_mod.applyEdit(alloc, store, agents, req) catch |err| {
         out.appendSlice(alloc, "error: edit failed: ") catch {};
@@ -387,10 +416,13 @@ fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 
 fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     _ = explorer;
+    store.mu.lock();
+    const file_count = store.files.count();
+    store.mu.unlock();
     const w = out.writer(alloc);
     w.print("codedb2 status:\n  seq: {d}\n  files: {d}\n", .{
         store.currentSeq(),
-        store.currentSeq(), // approximate — each initial scan file = 1 seq
+        file_count,
     }) catch {};
 }
 

@@ -27,6 +27,7 @@ pub fn applyEdit(
 ) !EditResult {
     const has_lock = try agents.tryLock(req.agent_id, req.path, 30_000);
     if (!has_lock) return error.FileLocked;
+    errdefer agents.releaseLock(req.agent_id, req.path);
 
     const file = try std.fs.cwd().openFile(req.path, .{});
     defer file.close();
@@ -38,10 +39,17 @@ pub fn applyEdit(
     var iter = std.mem.splitScalar(u8, source, '\n');
     while (iter.next()) |line| try lines.append(allocator, line);
 
+    // A trailing newline produces an empty final element; don't count it as a line
+    const had_trailing_newline = lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0;
+    if (had_trailing_newline) {
+        _ = lines.pop();
+    }
+
     switch (req.op) {
         .replace => {
             if (req.range) |range| {
-                const start = range[0] -| 1;
+                if (range[0] == 0 or range[1] < range[0] or range[0] > lines.items.len) return error.InvalidRange;
+                const start = range[0] - 1;
                 const end = @min(range[1], lines.items.len);
                 const new_content = req.content orelse return error.MissingContent;
                 var new_lines: std.ArrayList([]const u8) = .{};
@@ -60,13 +68,19 @@ pub fn applyEdit(
         },
         .delete => {
             if (req.range) |range| {
-                const start = range[0] -| 1;
+                if (range[0] == 0 or range[1] < range[0] or range[0] > lines.items.len) return error.InvalidRange;
+                const start = range[0] - 1;
                 const end = @min(range[1], lines.items.len);
                 // Remove lines [start..end) by replacing with nothing
                 try lines.replaceRange(allocator, start, end - start, &.{});
             }
         },
         else => {},
+    }
+
+    // Restore trailing newline if the original file had one
+    if (had_trailing_newline) {
+        try lines.append(allocator, "");
     }
 
     const result = try std.mem.join(allocator, "\n", lines.items);

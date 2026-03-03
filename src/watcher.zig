@@ -9,9 +9,25 @@ pub const EventKind = enum(u8) {
 };
 
 pub const FsEvent = struct {
-    path: []const u8,
+    path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    path_len: usize,
     kind: EventKind,
     seq: u64,
+
+    pub fn init(src_path: []const u8, kind: EventKind, seq: u64) FsEvent {
+        std.debug.assert(src_path.len <= std.fs.max_path_bytes);
+        var event = FsEvent{
+            .path_len = src_path.len,
+            .kind = kind,
+            .seq = seq,
+        };
+        @memcpy(event.path_buf[0..src_path.len], src_path);
+        return event;
+    }
+
+    pub fn path(self: *const FsEvent) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
 };
 
 pub const EventQueue = struct {
@@ -22,7 +38,7 @@ pub const EventQueue = struct {
     tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     pub fn push(self: *EventQueue, event: FsEvent) bool {
-        const cur_tail = self.tail.load(.acquire);
+        const cur_tail = self.tail.load(.monotonic);
         const next_tail = (cur_tail + 1) % CAPACITY;
         if (next_tail == self.head.load(.acquire)) return false;
         self.events[cur_tail] = event;
@@ -31,7 +47,7 @@ pub const EventQueue = struct {
     }
 
     pub fn pop(self: *EventQueue) ?FsEvent {
-        const cur_head = self.head.load(.acquire);
+        const cur_head = self.head.load(.monotonic);
         if (cur_head == self.tail.load(.acquire)) return null;
         const event = self.events[cur_head];
         self.head.store((cur_head + 1) % CAPACITY, .release);
@@ -159,10 +175,10 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
             if (entry.kind != .file) continue;
             if (shouldSkip(entry.path)) continue;
             const stat = dir.statFile(entry.path) catch continue;
-            const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_s));
+            const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
             const hash = hashFile(dir, entry.path, tmp) catch 0;
             const duped = backing.dupe(u8, entry.path) catch continue;
-            known.put(duped, .{ .mtime = mtime, .hash = hash }) catch {};
+            known.put(duped, .{ .mtime = mtime, .hash = hash }) catch backing.free(duped);
         }
     }
 
@@ -191,6 +207,11 @@ fn hashFile(dir: std.fs.Dir, path: []const u8, allocator: std.mem.Allocator) !u6
     return std.hash.Wyhash.hash(0, content);
 }
 
+fn pushEventOrWait(queue: *EventQueue, event: FsEvent) void {
+    // Preserve prior drop-on-full behavior so producer never stalls permanently.
+    _ = queue.push(event);
+}
+
 
 fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known: *FileMap, root: []const u8, persistent: std.mem.Allocator, tmp: std.mem.Allocator) !void {
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
@@ -210,31 +231,33 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
         if (gop.found_existing) continue;
 
         const stat = dir.statFile(entry.path) catch continue;
-        const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_s));
+        const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
 
         if (known.get(entry.path)) |old| {
-            // Mtime unchanged → skip (cheap path, no IO)
+            // Mtime unchanged -> skip (cheap path, no IO)
             if (old.mtime == mtime) continue;
 
-            // Mtime changed → hash to confirm content actually differs
+            // Mtime changed -> hash to confirm content actually differs
             const hash = hashFile(dir, entry.path, tmp) catch 0;
             if (hash != 0 and hash == old.hash) {
-                // Content identical (e.g. touch, git checkout) — update mtime only
+                // Content identical (e.g. touch, git checkout) -> update mtime only
                 try known.put(entry.path, .{ .mtime = mtime, .hash = old.hash });
                 continue;
             }
 
             const seq = try store.recordSnapshot(entry.path, stat.size, hash);
-            _ = queue.push(.{ .path = entry.path, .kind = .modified, .seq = seq });
             try known.put(entry.path, .{ .mtime = mtime, .hash = hash });
+            const stable_path = known.getKey(entry.path).?;
+            pushEventOrWait(queue, FsEvent.init(stable_path, .modified, seq));
             indexFileContent(explorer, dir, entry.path, tmp) catch {};
         } else {
             // New file
             const hash = hashFile(dir, entry.path, tmp) catch 0;
             const duped = try persistent.dupe(u8, entry.path);
+            errdefer persistent.free(duped);
             const seq = try store.recordSnapshot(duped, stat.size, hash);
-            _ = queue.push(.{ .path = duped, .kind = .created, .seq = seq });
             try known.put(duped, .{ .mtime = mtime, .hash = hash });
+            pushEventOrWait(queue, FsEvent.init(duped, .created, seq));
             indexFileContent(explorer, dir, duped, tmp) catch {};
         }
     }
@@ -251,9 +274,11 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
     }
     for (to_remove.items) |path| {
         const seq = store.recordDelete(path, 0) catch continue;
-        _ = queue.push(.{ .path = path, .kind = .deleted, .seq = seq });
         explorer.removeFile(path);
-        _ = known.remove(path);
+        if (known.fetchRemove(path)) |kv| {
+            pushEventOrWait(queue, FsEvent.init(kv.key, .deleted, seq));
+            persistent.free(kv.key);
+        }
     }
 }
 

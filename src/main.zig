@@ -16,7 +16,6 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    // Parse args: either `codedb <command>` (uses CWD) or `codedb <root> <command>`
     var root: []const u8 = undefined;
     var cmd: []const u8 = undefined;
     var cmd_args_start: usize = undefined;
@@ -27,12 +26,10 @@ pub fn main() !void {
     }
 
     if (isCommand(args[1])) {
-        // `codedb <command>` — use CWD as root
         root = ".";
         cmd = args[1];
         cmd_args_start = 2;
     } else if (args.len >= 3) {
-        // `codedb <root> <command>` — explicit root
         root = args[1];
         cmd = args[2];
         cmd_args_start = 3;
@@ -41,21 +38,18 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    // Resolve root to absolute path for data dir keying
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_root = resolveRoot(root, &root_buf) catch {
         print("error: cannot resolve root path: {s}\n", .{root});
         std.process.exit(1);
     };
 
-    // Set up data directory: ~/.codedb/projects/<hash>/
     const data_dir = try getDataDir(allocator, abs_root);
     defer allocator.free(data_dir);
 
     var store = Store.init(allocator);
     defer store.deinit();
 
-    // Open data log in the project-specific data dir
     const data_log_path = try std.fmt.allocPrint(allocator, "{s}/data.log", .{data_dir});
     defer allocator.free(data_log_path);
     store.openDataLog(data_log_path) catch |err| {
@@ -77,19 +71,21 @@ pub fn main() !void {
             print("usage: codedb [root] outline <path>\n", .{});
             std.process.exit(1);
         };
-        if (explorer.getOutline(path)) |outline| {
-            print("{s} ({s}, {d} lines)\n", .{
-                outline.path, @tagName(outline.language), outline.line_count,
-            });
-            for (outline.symbols.items) |sym| {
-                print("  L{d}: {s} {s}", .{
-                    sym.line_start, @tagName(sym.kind), sym.name,
-                });
-                if (sym.detail) |d| print("  // {s}", .{d});
-                print("\n", .{});
-            }
-        } else {
+        var outline = explorer.getOutline(path, allocator) catch {
+            print("error: failed to load outline for {s}\n", .{path});
+            std.process.exit(1);
+        } orelse {
             print("not found: {s}\n", .{path});
+            return;
+        };
+        defer outline.deinit();
+        print("{s} ({s}, {d} lines)\n", .{
+            outline.path, @tagName(outline.language), outline.line_count,
+        });
+        for (outline.symbols.items) |sym| {
+            print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name });
+            if (sym.detail) |d| print("  // {s}", .{d});
+            print("\n", .{});
         }
     } else if (std.mem.eql(u8, cmd, "find")) {
         const name = if (args.len > cmd_args_start) args[cmd_args_start] else {
@@ -102,8 +98,44 @@ pub fn main() !void {
         } else {
             print("not found: {s}\n", .{name});
         }
+    } else if (std.mem.eql(u8, cmd, "search")) {
+        const query = if (args.len > cmd_args_start) args[cmd_args_start] else {
+            print("usage: codedb [root] search <query>\n", .{});
+            std.process.exit(1);
+        };
+        const results = try explorer.searchContent(query, allocator, 50);
+        defer {
+            for (results) |r| allocator.free(r.line_text);
+            allocator.free(results);
+        }
+        if (results.len == 0) {
+            print("no results for: {s}\n", .{query});
+        } else {
+            for (results) |r| {
+                print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text });
+            }
+        }
+    } else if (std.mem.eql(u8, cmd, "word")) {
+        const word = if (args.len > cmd_args_start) args[cmd_args_start] else {
+            print("usage: codedb [root] word <identifier>\n", .{});
+            std.process.exit(1);
+        };
+        const hits = try explorer.searchWord(word, allocator);
+        defer allocator.free(hits);
+        if (hits.len == 0) {
+            print("no hits for: {s}\n", .{word});
+        } else {
+            print("{d} hits for '{s}':\n", .{ hits.len, word });
+            for (hits) |h| {
+                print("  {s}:{d}\n", .{ h.path, h.line_num });
+            }
+        }
     } else if (std.mem.eql(u8, cmd, "hot")) {
-        const hot = try explorer.getHotFiles(&store, 10);
+        const hot = try explorer.getHotFiles(&store, allocator, 10);
+        defer {
+            for (hot) |path| allocator.free(path);
+            allocator.free(hot);
+        }
         for (hot) |path| print("{s}\n", .{path});
     } else if (std.mem.eql(u8, cmd, "serve")) {
         const port: u16 = 7719;
@@ -112,7 +144,6 @@ pub fn main() !void {
         _ = try agents.register("__filesystem__");
 
         var queue = watcher.EventQueue{};
-
         const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root });
         defer watch_thread.join();
 
@@ -120,16 +151,14 @@ pub fn main() !void {
         defer reap_thread.join();
 
         std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
-        try server.serve(allocator, &store, &agents, &explorer, &queue, port);
+        try server.serve(allocator, &store, &agents, &explorer, &queue, port, abs_root);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
 
-        // Write project root to data dir for debugging
         saveProjectInfo(allocator, data_dir, abs_root) catch {};
 
-        // Background watcher — keeps index fresh when files change externally
         var queue = watcher.EventQueue{};
         const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root });
         defer watch_thread.join();
@@ -143,7 +172,7 @@ pub fn main() !void {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "hot", "serve", "mcp" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "serve", "mcp" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -152,30 +181,21 @@ fn isCommand(arg: []const u8) bool {
 
 fn resolveRoot(root: []const u8, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
     if (std.mem.eql(u8, root, ".")) {
-        // Use actual CWD
         return std.fs.cwd().realpath(".", buf) catch return error.ResolveFailed;
     }
     return std.fs.cwd().realpath(root, buf) catch return error.ResolveFailed;
 }
 
 fn getDataDir(allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
-    // Hash the absolute path to create a unique project directory
     const hash = std.hash.Wyhash.hash(0, abs_root);
-
-    // Get home directory
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
-        // Fallback: use .codedb in project root
         return std.fmt.allocPrint(allocator, "{s}/.codedb", .{abs_root});
     };
     defer allocator.free(home);
-
     const dir = try std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash });
-
-    // Ensure directory exists
     std.fs.cwd().makePath(dir) catch |err| {
         std.log.warn("could not create data dir {s}: {}", .{ dir, err });
     };
-
     return dir;
 }
 
@@ -197,6 +217,8 @@ fn printUsage() void {
         \\  tree                        show file tree with symbols
         \\  outline <path>              show symbols in a file
         \\  find <name>                 find where a symbol is defined
+        \\  search <query>              full-text search (case-insensitive)
+        \\  word <identifier>           exact word lookup (inverted index)
         \\  hot                         recently modified files
         \\  serve                       start HTTP daemon on :7719
         \\  mcp                         start MCP server (JSON-RPC over stdio)

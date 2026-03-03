@@ -12,6 +12,7 @@ pub fn serve(
     explorer: *Explorer,
     queue: *watcher.EventQueue,
     port: u16,
+    root: []const u8,
 ) !void {
     _ = queue;
     const addr = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
@@ -21,7 +22,7 @@ pub fn serve(
 
     while (true) {
         const conn = try srv.accept();
-        _ = std.Thread.spawn(.{}, handleConnection, .{ allocator, store, agents, explorer, conn }) catch |err| {
+        _ = std.Thread.spawn(.{}, handleConnection, .{ allocator, store, agents, explorer, conn, root }) catch |err| {
             std.log.err("server: spawn failed: {}", .{err});
             continue;
         };
@@ -34,12 +35,37 @@ fn handleConnection(
     agents: *AgentRegistry,
     explorer: *Explorer,
     conn: std.net.Server.Connection,
+    root: []const u8,
 ) void {
+    _ = root;
     defer conn.stream.close();
 
     var buf: [65536]u8 = undefined;
-    const n = conn.stream.read(&buf) catch return;
-    const request = buf[0..n];
+    var total: usize = 0;
+    total = conn.stream.read(&buf) catch return;
+
+    // For POST requests, ensure we have the full body
+    if (mem_starts(buf[0..total], "POST")) {
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |header_end| {
+            const body_start = header_end + 4;
+            // Look for Content-Length in headers
+            const headers = buf[0..header_end];
+            var expected_total = total; // default: assume we have everything
+            if (std.mem.indexOf(u8, headers, "Content-Length: ")) |cl_pos| {
+                const cl_start = cl_pos + "Content-Length: ".len;
+                const cl_end = std.mem.indexOfPos(u8, headers, cl_start, "\r\n") orelse headers.len;
+                if (std.fmt.parseInt(usize, headers[cl_start..cl_end], 10) catch null) |content_length| {
+                    expected_total = body_start + content_length;
+                }
+            }
+            while (total < expected_total and total < buf.len) {
+                const extra = conn.stream.read(buf[total..]) catch break;
+                if (extra == 0) break;
+                total += extra;
+            }
+        }
+    }
+    const request = buf[0..total];
 
     // ── Health ──
     if (mem_starts(request, "GET /health")) {
@@ -123,6 +149,10 @@ fn handleConnection(
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing path\"}");
             return;
         };
+        if (!isPathSafe(path)) {
+            respondJson(conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
+            return;
+        }
         const agent_id = extractJsonInt(body, "agent") orelse {
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing agent\"}");
             return;
@@ -172,6 +202,10 @@ fn handleConnection(
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing ?path=\"}");
             return;
         };
+        if (!isPathSafe(path)) {
+            respondJson(conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
+            return;
+        }
         const file = std.fs.cwd().openFile(path, .{}) catch {
             respondJson(conn, "404 Not Found", "{\"error\":\"file not found\"}");
             return;
@@ -246,11 +280,18 @@ fn handleConnection(
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing ?path=\"}");
             return;
         };
-        const outline = explorer.getOutline(path) orelse {
+        if (!isPathSafe(path)) {
+            respondJson(conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
+            return;
+        }
+        var outline = explorer.getOutline(path, allocator) catch {
+            respondJson(conn, "500 Internal Server Error", "{\"error\":\"outline failed\"}");
+            return;
+        } orelse {
             respondJson(conn, "404 Not Found", "{\"error\":\"file not indexed\"}");
             return;
         };
-
+        defer outline.deinit();
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(allocator);
         const w = out.writer(allocator);
@@ -315,12 +356,14 @@ fn handleConnection(
 
     // ── Explore: hot ──
     if (mem_starts(request, "GET /explore/hot")) {
-        const hot = explorer.getHotFiles(store, 10) catch {
+        const hot = explorer.getHotFiles(store, allocator, 10) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"hot files failed\"}");
             return;
         };
-        // hot is allocated by explorer's arena — do not free with our allocator
-
+        defer {
+            for (hot) |entry| allocator.free(entry);
+            allocator.free(hot);
+        }
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(allocator);
         const w = out.writer(allocator);
@@ -342,11 +385,14 @@ fn handleConnection(
             respondJson(conn, "400 Bad Request", "{\"error\":\"missing ?path=\"}");
             return;
         };
-        const imported_by = explorer.getImportedBy(path) catch {
+        const imported_by = explorer.getImportedBy(path, allocator) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"deps failed\"}");
             return;
         };
-        // imported_by is allocated by explorer's arena — do not free with our allocator
+        defer {
+            for (imported_by) |dep| allocator.free(dep);
+            allocator.free(imported_by);
+        }
 
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(allocator);
@@ -449,6 +495,16 @@ fn handleConnection(
 
 // ── Response helpers ────────────────────────────────────────
 
+fn isPathSafe(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/') return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
 fn respondJson(conn: std.net.Server.Connection, status: []const u8, body: []const u8) void {
     var hdr_buf: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, body.len }) catch return;
@@ -542,6 +598,18 @@ fn extractBody(request: []const u8) []const u8 {
     return "";
 }
 
+fn findUnescapedQuote(s: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1; // skip escaped char
+            continue;
+        }
+        if (s[i] == '"') return i;
+    }
+    return null;
+}
+
 /// Minimal JSON string extractor: finds "key":"value" and returns value.
 fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
     // Search for "key":"
@@ -557,7 +625,7 @@ fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
             while (next < json.len and (json[next] == ':' or json[next] == ' ')) : (next += 1) {}
             if (next >= json.len or json[next] != '"') return null;
             const val_start = next + 1;
-            const val_end = std.mem.indexOfPos(u8, json, val_start, "\"") orelse return null;
+            const val_end = findUnescapedQuote(json, val_start) orelse return null;
             return json[val_start..val_end];
         }
         pos = key_end + 1;

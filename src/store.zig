@@ -97,6 +97,13 @@ pub const Store = struct {
             .data_len = data_len,
         });
 
+        // Cap version history to prevent unbounded growth
+        const max_versions = 100;
+        if (entry.value_ptr.versions.items.len > max_versions) {
+            const excess = entry.value_ptr.versions.items.len - max_versions;
+            entry.value_ptr.versions.replaceRange(self.allocator, 0, excess, &.{}) catch {};
+        }
+
         return next_seq;
     }
 
@@ -105,6 +112,13 @@ pub const Store = struct {
         defer self.mu.unlock();
         const fv = self.files.get(path) orelse return null;
         return fv.latest();
+    }
+
+    /// Get latest version seq for a path. Caller must hold self.mu.
+    pub fn getLatestSeqUnlocked(self: *Store, path: []const u8) u64 {
+        const fv = self.files.get(path) orelse return 0;
+        const v = fv.latest() orelse return 0;
+        return v.seq;
     }
 
     pub fn getAtCursor(self: *Store, path: []const u8, cursor: u64) ?*const Version {
@@ -129,6 +143,7 @@ pub const Store = struct {
         self.mu.lock();
         defer self.mu.unlock();
         var result: std.ArrayList(ChangeEntry) = .{};
+        errdefer result.deinit(allocator);
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             const fv = entry.value_ptr;

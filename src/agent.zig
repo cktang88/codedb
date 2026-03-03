@@ -48,6 +48,7 @@ pub const AgentRegistry = struct {
             while (lp_iter.next()) |key| {
                 self.allocator.free(key.*);
             }
+            self.allocator.free(entry.value_ptr.name);
             entry.value_ptr.locked_paths.deinit();
         }
         self.agents.deinit();
@@ -61,9 +62,12 @@ pub const AgentRegistry = struct {
         const id = self.next_id;
         self.next_id += 1;
 
+        const duped_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(duped_name);
+
         try self.agents.put(id, .{
             .id = id,
-            .name = name,
+            .name = duped_name,
             .state = .active,
             .cursor = 0,
             .last_seen = std.time.milliTimestamp(),
@@ -96,7 +100,11 @@ pub const AgentRegistry = struct {
             const a = entry.value_ptr;
             if (a.state == .active and (now - a.last_seen) > timeout_ms) {
                 a.state = .crashed;
-                // Release all locks held by crashed agent
+                // Release all locks held by crashed agent.
+                var key_iter = a.locked_paths.keyIterator();
+                while (key_iter.next()) |key| {
+                    self.allocator.free(key.*);
+                }
                 a.locked_paths.clearAndFree();
             }
         }
@@ -109,29 +117,34 @@ pub const AgentRegistry = struct {
 
         const now = std.time.milliTimestamp();
 
-        // Check if any other active agent holds this lock
+        // Check if any other active agent holds this lock.
         var iter = self.agents.iterator();
         while (iter.next()) |entry| {
             const a = entry.value_ptr;
             if (a.id == agent_id) continue;
             if (a.locked_paths.get(path)) |expiry| {
                 if (now < expiry) return false; // someone else holds it
-                // Expired — remove it and free the duped key
+                // Expired: remove it and free the duped key.
                 if (a.locked_paths.fetchRemove(path)) |kv| {
                     self.allocator.free(kv.key);
                 }
             }
         }
 
-        // Grant the lock
+        // Grant the lock.
         if (self.agents.getPtr(agent_id)) |a| {
+            if (a.locked_paths.getPtr(path)) |expiry| {
+                expiry.* = now + ttl_ms;
+                return true;
+            }
+
             const duped = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(duped);
             try a.locked_paths.put(duped, now + ttl_ms);
             return true;
         }
         return false;
     }
-
     pub fn releaseLock(self: *AgentRegistry, agent_id: AgentId, path: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();

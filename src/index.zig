@@ -70,6 +70,7 @@ pub const WordIndex = struct {
         self.removeFile(path);
 
         var words_set = std.StringHashMap(void).init(self.allocator);
+        errdefer words_set.deinit();
         var line_num: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
 
@@ -116,15 +117,16 @@ pub const WordIndex = struct {
     /// Deduplicates by (path, line_num).
     pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
         const hits = self.search(word);
-        if (hits.len == 0) return &.{};
+        if (hits.len == 0) return try allocator.alloc(WordHit, 0);
 
-        var seen = std.AutoHashMap(u64, void).init(allocator);
+        const DedupKey = struct { path_ptr: usize, line_num: u32 };
+        var seen = std.AutoHashMap(DedupKey, void).init(allocator);
         defer seen.deinit();
 
         var result: std.ArrayList(WordHit) = .{};
+        errdefer result.deinit(allocator);
         for (hits) |hit| {
-            // Hash path ptr + line for dedup
-            const key = std.hash.Wyhash.hash(0, hit.path) ^ @as(u64, hit.line_num);
+            const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
             const gop = try seen.getOrPut(key);
             if (!gop.found_existing) {
                 try result.append(allocator, hit);
@@ -213,6 +215,7 @@ pub const TrigramIndex = struct {
 
         // Store which trigrams this file contributed
         var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
         var tri_iter = seen_trigrams.keyIterator();
         while (tri_iter.next()) |tri_ptr| {
             try tri_list.append(self.allocator, tri_ptr.*);
@@ -237,8 +240,8 @@ pub const TrigramIndex = struct {
             );
 
             const file_set = self.index.getPtr(tri) orelse {
-                // This trigram doesn't exist — no files match
-                return &.{};
+                // This trigram doesn't exist — no files match.
+                return self.allocator.alloc([]const u8, 0) catch null;
             };
 
             if (first) {
@@ -247,7 +250,6 @@ pub const TrigramIndex = struct {
                 while (fiter.next()) |path_ptr| {
                     result_set.put(path_ptr.*, {}) catch return null;
                 }
-                first = true; // still need to set this properly
                 first = false;
             } else {
                 // Intersect: remove paths not in this trigram's set
@@ -265,7 +267,9 @@ pub const TrigramIndex = struct {
                 }
             }
 
-            if (result_set.count() == 0) return &.{};
+            if (result_set.count() == 0) {
+                return self.allocator.alloc([]const u8, 0) catch null;
+            }
         }
 
         // Convert to slice
@@ -274,7 +278,10 @@ pub const TrigramIndex = struct {
         while (kiter.next()) |path_ptr| {
             result.append(self.allocator, path_ptr.*) catch continue;
         }
-        return result.toOwnedSlice(self.allocator) catch return null;
+        return result.toOwnedSlice(self.allocator) catch {
+            result.deinit(self.allocator);
+            return null;
+        };
     }
 };
 
