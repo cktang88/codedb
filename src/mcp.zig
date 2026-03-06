@@ -145,8 +145,6 @@ fn handleCall(
         if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing tool name");
         return;
     };
-    // Use a fresh empty ObjectMap (not a shallow copy) to avoid use-after-free
-    // if the defer-deinit'd local were to be copied into args_value.
     var args_value = params.get("arguments") orelse std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
     if (args_value != .object) {
         if (!is_notification) writeError(alloc, stdout, id, -32602, "arguments must be object");
@@ -162,20 +160,54 @@ fn handleCall(
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(alloc);
 
+    const t0 = std.time.nanoTimestamp();
     dispatch(alloc, tool, args, &out, store, explorer, agents, prerender);
+    const elapsed = std.time.nanoTimestamp() - t0;
+
     if (is_notification) return;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
 
-    // Wrap in MCP content envelope
+    // Block 1: Human-readable colored summary (ANSI — preview pane always renders it)
+    var summary: std.ArrayList(u8) = .{};
+    defer summary.deinit(alloc);
+    summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
+    summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
+    mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
+    var dur_buf: [96]u8 = undefined;
+    summary.appendSlice(alloc, mcpFormatDuration(&dur_buf, elapsed)) catch {};
+
+    // Block 3: Guidance hints
+    var guidance: std.ArrayList(u8) = .{};
+    defer guidance.deinit(alloc);
+    mcpGenerateGuidance(alloc, name, args, is_error, &guidance);
+
+    // Assemble 3-block MCP content envelope
     var result: std.ArrayList(u8) = .{};
     defer result.deinit(alloc);
-    result.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":\"") catch return;
+    result.appendSlice(alloc, "{\"content\":[") catch return;
+
+    // Block 1 (summary)
+    if (summary.items.len > 0) {
+        result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+        writeEscaped(alloc, &result, summary.items);
+        result.appendSlice(alloc, "\"},") catch return;
+    }
+
+    // Block 2 (raw data — no colors, zero extra tokens to model)
+    result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
     writeEscaped(alloc, &result, out.items);
-    result.appendSlice(alloc, if (is_error) "\"}],\"isError\":true}" else "\"}],\"isError\":false}") catch return;
+    result.appendSlice(alloc, "\"}") catch return;
 
+    // Block 3 (guidance)
+    if (guidance.items.len > 0) {
+        result.appendSlice(alloc, ",{\"type\":\"text\",\"text\":\"") catch return;
+        writeEscaped(alloc, &result, guidance.items);
+        result.appendSlice(alloc, "\"}") catch return;
+    }
+
+    result.appendSlice(alloc, if (is_error) "],\"isError\":true}" else "],\"isError\":false}") catch return;
     writeResult(alloc, stdout, id, result.items);
-
 }
 
 fn dispatch(
@@ -775,5 +807,240 @@ fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8
                 out.append(alloc, c) catch return;
             },
         }
+    }
+}
+
+// ── MCP UX: 3-block response helpers ────────────────────────────────────────
+// Colors are always on — MCP preview pane always renders ANSI. No TTY check.
+
+const MCP_RESET        = "\x1b[0m";
+const MCP_BOLD         = "\x1b[1m";
+const MCP_DIM          = "\x1b[2m";
+const MCP_GREEN        = "\x1b[32m";
+const MCP_RED          = "\x1b[31m";
+const MCP_CYAN         = "\x1b[36m";
+const MCP_YELLOW       = "\x1b[33m";
+const MCP_MAGENTA      = "\x1b[35m";
+const MCP_BLUE         = "\x1b[34m";
+const MCP_BRIGHT_GREEN = "\x1b[92m";
+
+const MCP_CHECK = "\xe2\x9c\x93";    // ✓
+const MCP_CROSS = "\xe2\x9c\x97";    // ✗
+const MCP_DASH  = " \xe2\x80\x94 "; //  —
+const MCP_ARROW = "\xe2\x86\x92 ";  // →
+const MCP_DOT   = "\xe2\x80\xa2 ";  // •
+const MCP_ZAP   = "\xe2\x9a\xa1";   // ⚡
+
+fn mcpFormatDuration(buf: []u8, ns: i128) []const u8 {
+    if (ns <= 0) return "";
+    const uns: u64 = @intCast(@min(ns, std.math.maxInt(u64)));
+    if (uns < 1_000) {
+        return std.fmt.bufPrint(buf, "  " ++ MCP_CYAN ++ MCP_ZAP ++ " {d}ns" ++ MCP_RESET, .{uns}) catch "";
+    } else if (uns < 1_000_000) {
+        const us = uns / 1_000;
+        const frac = (uns % 1_000) / 100;
+        return std.fmt.bufPrint(buf, "  " ++ MCP_CYAN ++ MCP_ZAP ++ " {d}.{d}\xc2\xb5s" ++ MCP_RESET, .{ us, frac }) catch "";
+    } else if (uns < 1_000_000_000) {
+        const ms = uns / 1_000_000;
+        const frac = (uns % 1_000_000) / 100_000;
+        if (ms < 10) {
+            return std.fmt.bufPrint(buf, "  " ++ MCP_BRIGHT_GREEN ++ MCP_ZAP ++ " {d}.{d}ms" ++ MCP_RESET, .{ ms, frac }) catch "";
+        } else if (ms < 100) {
+            return std.fmt.bufPrint(buf, "  " ++ MCP_GREEN ++ "{d}.{d}ms" ++ MCP_RESET, .{ ms, frac }) catch "";
+        } else {
+            return std.fmt.bufPrint(buf, "  " ++ MCP_BLUE ++ "{d}.{d}ms" ++ MCP_RESET, .{ ms, frac }) catch "";
+        }
+    } else {
+        const s = uns / 1_000_000_000;
+        const frac = (uns % 1_000_000_000) / 100_000_000;
+        return std.fmt.bufPrint(buf, "  " ++ MCP_YELLOW ++ "{d}.{d}s" ++ MCP_RESET, .{ s, frac }) catch "";
+    }
+}
+
+fn mcpToolIcon(tool_name: []const u8) []const u8 {
+    if (eql(tool_name, "codedb_outline")) return MCP_BLUE    ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_symbol"))  return MCP_BLUE    ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_read"))    return MCP_BLUE    ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_search"))  return MCP_MAGENTA ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_word"))    return MCP_CYAN    ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_edit"))    return MCP_YELLOW  ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_tree"))    return MCP_GREEN   ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_hot"))     return MCP_YELLOW  ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_deps"))    return MCP_CYAN    ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_changes")) return MCP_YELLOW  ++ MCP_DOT ++ MCP_RESET;
+    if (eql(tool_name, "codedb_bundle"))  return MCP_MAGENTA ++ MCP_DOT ++ MCP_RESET;
+    return MCP_DIM ++ MCP_DOT ++ MCP_RESET;
+}
+
+fn mcpPathBasename(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| return path[pos + 1 ..];
+    return path;
+}
+
+fn mcpPathParent(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| return path[0..pos];
+    return "";
+}
+
+fn mcpAppendPath(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), path: []const u8) void {
+    const name = mcpPathBasename(path);
+    const parent = mcpPathParent(path);
+    if (parent.len > 0) {
+        buf.appendSlice(alloc, MCP_DIM) catch {};
+        buf.appendSlice(alloc, parent) catch {};
+        buf.appendSlice(alloc, "/" ++ MCP_RESET) catch {};
+    }
+    buf.appendSlice(alloc, MCP_BOLD) catch {};
+    buf.appendSlice(alloc, name) catch {};
+    buf.appendSlice(alloc, MCP_RESET) catch {};
+}
+
+fn mcpGenerateSummary(
+    alloc: std.mem.Allocator,
+    tool_name: []const u8,
+    args: *const std.json.ObjectMap,
+    output: []const u8,
+    is_error: bool,
+    buf: *std.ArrayList(u8),
+) void {
+    // Readable label: strip "codedb_" prefix
+    const label = if (std.mem.indexOf(u8, tool_name, "_")) |i| tool_name[i + 1 ..] else tool_name;
+    buf.appendSlice(alloc, MCP_BOLD) catch {};
+    buf.appendSlice(alloc, label) catch {};
+    buf.appendSlice(alloc, MCP_RESET) catch {};
+
+    if (is_error) {
+        const msg = if (std.mem.startsWith(u8, output, "error: ")) output[7..] else output;
+        const end = std.mem.indexOfScalar(u8, msg, '\n') orelse msg.len;
+        buf.appendSlice(alloc, MCP_DASH ++ MCP_RED) catch {};
+        buf.appendSlice(alloc, msg[0..end]) catch {};
+        buf.appendSlice(alloc, MCP_RESET) catch {};
+        return;
+    }
+
+    if (eql(tool_name, "codedb_search") or eql(tool_name, "codedb_word")) {
+        const q = getStr(args, "query") orelse getStr(args, "word") orelse "";
+        // First line: "N results for 'q':\n" or "N hits for 'w':\n"
+        const nl = std.mem.indexOfScalar(u8, output, '\n') orelse output.len;
+        const sp = std.mem.indexOfScalar(u8, output[0..nl], ' ') orelse nl;
+        buf.appendSlice(alloc, "  " ++ MCP_BOLD ++ "'") catch {};
+        buf.appendSlice(alloc, q) catch {};
+        buf.appendSlice(alloc, "'" ++ MCP_RESET ++ MCP_DASH ++ MCP_CYAN ++ MCP_BOLD) catch {};
+        buf.appendSlice(alloc, output[0..sp]) catch {};
+        buf.appendSlice(alloc, MCP_RESET) catch {};
+        buf.appendSlice(alloc, if (eql(tool_name, "codedb_search")) " results" else " hits") catch {};
+        if (getBool(args, "scope")) {
+            buf.appendSlice(alloc, MCP_DIM ++ "  (scoped)" ++ MCP_RESET) catch {};
+        }
+    } else if (eql(tool_name, "codedb_outline")) {
+        const path = getStr(args, "path") orelse "";
+        buf.appendSlice(alloc, "  ") catch {};
+        mcpAppendPath(alloc, buf, path);
+        // Parse meta from first line: "path (lang, N lines, N bytes)"
+        if (std.mem.indexOfScalar(u8, output, '(')) |lp| {
+            if (std.mem.indexOfScalarPos(u8, output, lp, ')')) |rp| {
+                buf.appendSlice(alloc, MCP_DASH ++ MCP_DIM) catch {};
+                buf.appendSlice(alloc, output[lp + 1 .. rp]) catch {};
+                buf.appendSlice(alloc, MCP_RESET) catch {};
+            }
+        }
+    } else if (eql(tool_name, "codedb_symbol")) {
+        const sym_name = getStr(args, "name") orelse "";
+        buf.appendSlice(alloc, MCP_DASH ++ MCP_MAGENTA ++ "fn " ++ MCP_RESET ++ MCP_BOLD) catch {};
+        buf.appendSlice(alloc, sym_name) catch {};
+        buf.appendSlice(alloc, MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_tree")) {
+        var file_count: usize = 0;
+        var it = std.mem.splitScalar(u8, output, '\n');
+        while (it.next()) |line| {
+            const t = std.mem.trim(u8, line, " ");
+            if (t.len > 0 and !std.mem.endsWith(u8, t, "/")) file_count += 1;
+        }
+        var tmp: [32]u8 = undefined;
+        buf.appendSlice(alloc, "  " ++ MCP_CYAN ++ MCP_BOLD) catch {};
+        buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{file_count}) catch "?") catch {};
+        buf.appendSlice(alloc, MCP_RESET ++ " files") catch {};
+    } else if (eql(tool_name, "codedb_read") or eql(tool_name, "codedb_deps")) {
+        const path = getStr(args, "path") orelse "";
+        buf.appendSlice(alloc, "  ") catch {};
+        mcpAppendPath(alloc, buf, path);
+    } else if (eql(tool_name, "codedb_edit")) {
+        const path = getStr(args, "path") orelse "";
+        buf.appendSlice(alloc, "  ") catch {};
+        mcpAppendPath(alloc, buf, path);
+    } else if (eql(tool_name, "codedb_hot")) {
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, output, '\n');
+        while (it.next()) |line| {
+            if (std.mem.trim(u8, line, " ").len > 0) count += 1;
+        }
+        var tmp: [32]u8 = undefined;
+        buf.appendSlice(alloc, "  " ++ MCP_CYAN ++ MCP_BOLD) catch {};
+        buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{count}) catch "?") catch {};
+        buf.appendSlice(alloc, MCP_RESET ++ " files") catch {};
+    } else if (eql(tool_name, "codedb_status")) {
+        var files_str: []const u8 = "?";
+        var seq_str: []const u8 = "?";
+        if (std.mem.indexOf(u8, output, "files: ")) |i| {
+            const after = output[i + 7 ..];
+            files_str = after[0 .. std.mem.indexOfScalar(u8, after, '\n') orelse after.len];
+        }
+        if (std.mem.indexOf(u8, output, "seq: ")) |i| {
+            const after = output[i + 5 ..];
+            seq_str = after[0 .. std.mem.indexOfScalar(u8, after, '\n') orelse after.len];
+        }
+        buf.appendSlice(alloc, "  " ++ MCP_CYAN ++ MCP_BOLD) catch {};
+        buf.appendSlice(alloc, files_str) catch {};
+        buf.appendSlice(alloc, MCP_RESET ++ " files" ++ MCP_DASH ++ MCP_DIM ++ "seq ") catch {};
+        buf.appendSlice(alloc, seq_str) catch {};
+        buf.appendSlice(alloc, MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_changes")) {
+        if (getInt(args, "since")) |since| {
+            var tmp: [32]u8 = undefined;
+            buf.appendSlice(alloc, "  " ++ MCP_DIM ++ "since seq ") catch {};
+            buf.appendSlice(alloc, std.fmt.bufPrint(&tmp, "{d}", .{since}) catch "0") catch {};
+            buf.appendSlice(alloc, MCP_RESET) catch {};
+        }
+    } else if (eql(tool_name, "codedb_bundle")) {
+        const path = getStr(args, "path") orelse "";
+        if (path.len > 0) {
+            buf.appendSlice(alloc, "  ") catch {};
+            mcpAppendPath(alloc, buf, path);
+        }
+    }
+    // codedb_snapshot, codedb_status: label + timer is enough
+}
+
+fn mcpGenerateGuidance(
+    alloc: std.mem.Allocator,
+    tool_name: []const u8,
+    args: *const std.json.ObjectMap,
+    is_error: bool,
+    buf: *std.ArrayList(u8),
+) void {
+    if (is_error) {
+        if (eql(tool_name, "codedb_outline") or eql(tool_name, "codedb_read") or eql(tool_name, "codedb_deps")) {
+            buf.appendSlice(alloc, MCP_DIM ++ "hint: use codedb_tree to verify file paths" ++ MCP_RESET) catch {};
+        } else if (eql(tool_name, "codedb_edit")) {
+            buf.appendSlice(alloc, MCP_DIM ++ "hint: use codedb_outline to verify structure before editing" ++ MCP_RESET) catch {};
+        }
+        return;
+    }
+    if (eql(tool_name, "codedb_tree")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline path=<file> to inspect symbols" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_outline")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> to read a function body" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_symbol")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_search")) {
+        if (!getBool(args, "scope")) {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: add scope=true to see enclosing functions" ++ MCP_RESET) catch {};
+        }
+    } else if (eql(tool_name, "codedb_word")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline on a result file for full context" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_edit")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_changes to verify edits" ++ MCP_RESET) catch {};
+    } else if (eql(tool_name, "codedb_hot")) {
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline on a hot file to see recent changes" ++ MCP_RESET) catch {};
     }
 }
