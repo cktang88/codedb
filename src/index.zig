@@ -169,20 +169,27 @@ pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allo
 
 pub const Trigram = u24;
 
-fn packTrigram(a: u8, b: u8, c: u8) Trigram {
+pub fn packTrigram(a: u8, b: u8, c: u8) Trigram {
     return @as(Trigram, a) << 16 | @as(Trigram, b) << 8 | @as(Trigram, c);
 }
 
+
+pub const PostingMask = struct {
+    next_mask: u8 = 0, // bloom filter of chars following this trigram
+    loc_mask: u8 = 0, // bit mask of (position % 8) where trigram appears
+};
+
+
 pub const TrigramIndex = struct {
     /// trigram → set of file paths
-    index: std.AutoHashMap(Trigram, std.StringHashMap(void)),
+    index: std.AutoHashMap(Trigram, std.StringHashMap(PostingMask)),
     /// path → list of trigrams contributed (for cleanup)
     file_trigrams: std.StringHashMap(std.ArrayList(Trigram)),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
-            .index = std.AutoHashMap(Trigram, std.StringHashMap(void)).init(allocator),
+            .index = std.AutoHashMap(Trigram, std.StringHashMap(PostingMask)).init(allocator),
             .file_trigrams = std.StringHashMap(std.ArrayList(Trigram)).init(allocator),
             .allocator = allocator,
         };
@@ -223,7 +230,7 @@ pub const TrigramIndex = struct {
         var seen_trigrams = std.AutoHashMap(Trigram, void).init(self.allocator);
         defer seen_trigrams.deinit();
 
-        // Extract unique trigrams from content
+        // Extract trigrams from content, recording PostingMask per (trigram, file)
         if (content.len >= 3) {
             for (0..content.len - 2) |i| {
                 const tri = packTrigram(
@@ -231,14 +238,22 @@ pub const TrigramIndex = struct {
                     normalizeChar(content[i + 1]),
                     normalizeChar(content[i + 2]),
                 );
-                const gop = try seen_trigrams.getOrPut(tri);
-                if (!gop.found_existing) {
-                    // Add to global index
-                    const idx_gop = try self.index.getOrPut(tri);
-                    if (!idx_gop.found_existing) {
-                        idx_gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
-                    }
-                    try idx_gop.value_ptr.put(path, {});
+                // Ensure the trigram → file_set entry exists
+                const idx_gop = try self.index.getOrPut(tri);
+                if (!idx_gop.found_existing) {
+                    idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
+                }
+                // Get or create the posting for this file
+                const file_gop = try idx_gop.value_ptr.getOrPut(path);
+                if (!file_gop.found_existing) {
+                    file_gop.value_ptr.* = PostingMask{};
+                    // Track this trigram for cleanup (only once per file)
+                    try seen_trigrams.put(tri, {});
+                }
+                // OR in position masks
+                file_gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < content.len) {
+                    file_gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
                 }
             }
         }
@@ -252,6 +267,7 @@ pub const TrigramIndex = struct {
         }
         try self.file_trigrams.put(path, tri_list);
     }
+
 
     /// Find candidate files that contain ALL trigrams from the query.
 pub fn candidates(self: *TrigramIndex, query: []const u8) ?[]const []const u8 {
@@ -272,7 +288,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8) ?[]const []const u8 {
         _ = unique.getOrPut(tri) catch return null;
     }
 
-    var sets: std.ArrayList(*const std.StringHashMap(void)) = .{};
+    var sets: std.ArrayList(*std.StringHashMap(PostingMask)) = .{};
     defer sets.deinit(self.allocator);
     sets.ensureTotalCapacity(self.allocator, unique.count()) catch return null;
 
@@ -304,16 +320,43 @@ pub fn candidates(self: *TrigramIndex, query: []const u8) ?[]const []const u8 {
     result.ensureTotalCapacity(self.allocator, min_count) catch return null;
 
     var it = sets.items[min_idx].keyIterator();
-    while (it.next()) |path_ptr| {
-        var ok = true;
+    next_cand: while (it.next()) |path_ptr| {
+
+        // Intersection check: candidate must be in all sets
         for (sets.items, 0..) |set, i| {
             if (i == min_idx) continue;
-            if (!set.contains(path_ptr.*)) {
-                ok = false;
-                break;
+            if (!set.contains(path_ptr.*)) continue :next_cand;
+        }
+
+        // Bloom-filter check for consecutive trigram pairs
+        if (tri_count >= 2) {
+            for (0..tri_count - 1) |j| {
+                const tri_a = packTrigram(
+                    normalizeChar(query[j]),
+                    normalizeChar(query[j + 1]),
+                    normalizeChar(query[j + 2]),
+                );
+                const tri_b = packTrigram(
+                    normalizeChar(query[j + 1]),
+                    normalizeChar(query[j + 2]),
+                    normalizeChar(query[j + 3]),
+                );
+                const set_a = self.index.getPtr(tri_a) orelse continue;
+                const set_b = self.index.getPtr(tri_b) orelse continue;
+                const mask_a = set_a.get(path_ptr.*) orelse continue;
+                const mask_b = set_b.get(path_ptr.*) orelse continue;
+
+                // next_mask: bit for query[j+3] must be set in tri_a's next_mask
+                const next_bit: u8 = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8);
+                if ((mask_a.next_mask & next_bit) == 0) continue :next_cand;
+
+                // loc_mask adjacency: use circular shift to handle position wrap-around
+                const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
+                if ((rotated & mask_b.loc_mask) == 0) continue :next_cand;
             }
         }
-        if (ok) result.appendAssumeCapacity(path_ptr.*);
+
+        result.appendAssumeCapacity(path_ptr.*);
     }
 
     return result.toOwnedSlice(self.allocator) catch {
@@ -321,6 +364,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8) ?[]const []const u8 {
         return null;
     };
 }
+
 };
 
 // ── Tokenizer ───────────────────────────────────────────────
@@ -348,7 +392,7 @@ fn isWordChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-fn normalizeChar(c: u8) u8 {
+pub fn normalizeChar(c: u8) u8 {
     // Lowercase for case-insensitive trigram matching
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }

@@ -1,8 +1,12 @@
 const std = @import("std");
 const Explorer = @import("explore.zig").Explorer;
-const WordIndex = @import("index.zig").WordIndex;
-const TrigramIndex = @import("index.zig").TrigramIndex;
-
+const index = @import("index.zig");
+const WordIndex = index.WordIndex;
+const TrigramIndex = index.TrigramIndex;
+const Trigram = index.Trigram;
+const PostingMask = index.PostingMask;
+const packTrigram = index.packTrigram;
+const normalizeChar = index.normalizeChar;
 const FileEntry = struct { name: []const u8, content: []const u8 };
 
 fn generateCode(allocator: std.mem.Allocator, num_files: usize, lines_per_file: usize) ![]const FileEntry {
@@ -108,7 +112,7 @@ pub fn main() !void {
         total_hits / word_iters,
     });
 
-    // ── Bench: trigram candidate lookup (no verify) ──
+    // ── Bench: trigram candidate lookup (with bloom filtering) ──
     const tri_queries = [_][]const u8{ "handleRequest", "processData", "AgentRegistry", "pub fn init", "TrigramIndex" };
 
     timer.reset();
@@ -127,6 +131,86 @@ pub fn main() !void {
         @as(f64, @floatFromInt(tri_ns)) / @as(f64, @floatFromInt(tri_total)),
     });
 
+    // ── Bloom filter effectiveness: candidate set sizes ──
+    std.debug.print("\n── Bloom Filter Effectiveness ──\n", .{});
+    for (tri_queries) |q| {
+        // Get candidate count with bloom filtering (current behavior)
+        const bloom_cands = ti.candidates(q);
+        const bloom_count = if (bloom_cands) |c| blk: {
+            defer allocator.free(c);
+            break :blk c.len;
+        } else num_files;
+
+        // Count candidates from pure trigram intersection (no bloom)
+        // by counting files present in ALL trigram posting lists
+        var pure_count: usize = 0;
+        if (q.len >= 3) {
+            const tri_count = q.len - 2;
+            var unique = std.AutoHashMap(Trigram, void).init(allocator);
+            defer unique.deinit();
+            for (0..tri_count) |j| {
+                const tri = packTrigram(
+                    normalizeChar(q[j]),
+                    normalizeChar(q[j + 1]),
+                    normalizeChar(q[j + 2]),
+                );
+                unique.put(tri, {}) catch {};
+            }
+
+            // Collect posting list pointers
+            var sets: std.ArrayList(*const std.StringHashMap(PostingMask)) = .{};
+            defer sets.deinit(allocator);
+            var all_found = true;
+            var tri_iter = unique.keyIterator();
+            while (tri_iter.next()) |tri_ptr| {
+                if (ti.index.getPtr(tri_ptr.*)) |file_set| {
+                    sets.append(allocator, file_set) catch {};
+                } else {
+                    all_found = false;
+                    break;
+                }
+            }
+
+            if (all_found and sets.items.len > 0) {
+                // Find smallest set, intersect
+                var min_idx: usize = 0;
+                var min_count: usize = sets.items[0].count();
+                for (sets.items[1..], 1..) |set, idx| {
+                    if (set.count() < min_count) {
+                        min_count = set.count();
+                        min_idx = idx;
+                    }
+                }
+                var it = sets.items[min_idx].keyIterator();
+                while (it.next()) |path_ptr| {
+                    var ok = true;
+                    for (sets.items, 0..) |set, idx| {
+                        if (idx == min_idx) continue;
+                        if (!set.contains(path_ptr.*)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) pure_count += 1;
+                }
+            }
+        }
+
+        // Count actual matches via brute force
+        var actual_count: usize = 0;
+        var c_iter = contents.iterator();
+        while (c_iter.next()) |entry| {
+            if (std.mem.indexOf(u8, entry.value_ptr.*, q) != null) {
+                actual_count += 1;
+            }
+        }
+
+        const reduction = if (pure_count > 0) @as(f64, @floatFromInt(pure_count - bloom_count)) / @as(f64, @floatFromInt(pure_count)) * 100.0 else 0.0;
+        std.debug.print("  \"{s}\":\n    trigram-only={d}  bloom={d}  actual={d}  reduction={d:.0}%\n", .{
+            q, pure_count, bloom_count, actual_count, reduction,
+        });
+    }
+
     // ── Bench: brute force substring search ──
     timer.reset();
     const brute_iters: usize = 1_000;
@@ -140,7 +224,7 @@ pub fn main() !void {
     }
     const brute_ns = timer.read();
     const brute_total = brute_iters * tri_queries.len;
-    std.debug.print("Brute force ×{d}:      {d:.1} ms total, {d:.0} ns/query\n", .{
+    std.debug.print("\nBrute force ×{d}:      {d:.1} ms total, {d:.0} ns/query\n", .{
         brute_total,
         @as(f64, @floatFromInt(brute_ns)) / 1_000_000.0,
         @as(f64, @floatFromInt(brute_ns)) / @as(f64, @floatFromInt(brute_total)),
@@ -148,7 +232,7 @@ pub fn main() !void {
 
     std.debug.print("\n── Summary ({d} files, {d}K lines, {d} KB) ──\n", .{ num_files, total_lines / 1000, total_bytes / 1024 });
     std.debug.print("Word index:    {d:.0} ns/query  (zero-alloc hash lookup)\n", .{@as(f64, @floatFromInt(word_ns)) / @as(f64, @floatFromInt(word_total))});
-    std.debug.print("Trigram:       {d:.0} ns/query  (candidate set intersection)\n", .{@as(f64, @floatFromInt(tri_ns)) / @as(f64, @floatFromInt(tri_total))});
+    std.debug.print("Trigram:       {d:.0} ns/query  (candidate set + bloom filter)\n", .{@as(f64, @floatFromInt(tri_ns)) / @as(f64, @floatFromInt(tri_total))});
     std.debug.print("Brute force:   {d:.0} ns/query  (linear scan all content)\n", .{@as(f64, @floatFromInt(brute_ns)) / @as(f64, @floatFromInt(brute_total))});
     const speedup_word = @as(f64, @floatFromInt(brute_ns)) / @as(f64, @floatFromInt(brute_total)) / (@as(f64, @floatFromInt(word_ns)) / @as(f64, @floatFromInt(word_total)));
     const speedup_tri = @as(f64, @floatFromInt(brute_ns)) / @as(f64, @floatFromInt(brute_total)) / (@as(f64, @floatFromInt(tri_ns)) / @as(f64, @floatFromInt(tri_total)));
