@@ -692,21 +692,45 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         return;
     };
 
-    // Build URL: https://codedb.codegraff.com/{repo}/{action}?q={query}
+    // Build URL and curl args
     var url_buf: [512]u8 = undefined;
     const query = getStr(args, "query");
-    const url = if (std.mem.eql(u8, action, "search"))
-        std.fmt.bufPrint(&url_buf, "https://codedb.codegraff.com/{s}/search?q={s}", .{ repo, query orelse "" }) catch {
-            out.appendSlice(alloc, "error: URL too long") catch {};
-            return;
-        }
-    else
-        std.fmt.bufPrint(&url_buf, "https://codedb.codegraff.com/{s}/{s}", .{ repo, action }) catch {
+
+    if (std.mem.eql(u8, action, "search")) {
+        const base_url = std.fmt.bufPrint(&url_buf, "https://codedb.codegraff.com/{s}/search", .{repo}) catch {
             out.appendSlice(alloc, "error: URL too long") catch {};
             return;
         };
+        var q_buf: [256]u8 = undefined;
+        const q_param = std.fmt.bufPrint(&q_buf, "q={s}", .{query orelse ""}) catch {
+            out.appendSlice(alloc, "error: query too long") catch {};
+            return;
+        };
+        // -G + --data-urlencode lets curl handle encoding spaces etc.
+        const result = std.process.Child.run(.{
+            .allocator = alloc,
+            .argv = &.{ "curl", "-sf", "--max-time", "30", "-G", "--data-urlencode", q_param, base_url },
+        }) catch {
+            out.appendSlice(alloc, "error: failed to fetch from codedb.codegraff.com") catch {};
+            return;
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        if (result.term.Exited != 0) {
+            out.appendSlice(alloc, "error: codedb.codegraff.com returned error for ") catch {};
+            out.appendSlice(alloc, repo) catch {};
+            out.appendSlice(alloc, "/search") catch {};
+            return;
+        }
+        out.appendSlice(alloc, result.stdout) catch {};
+        return;
+    }
 
-    // Shell out to curl (simple, works everywhere, avoids Zig HTTP client issues)
+    const url = std.fmt.bufPrint(&url_buf, "https://codedb.codegraff.com/{s}/{s}", .{ repo, action }) catch {
+        out.appendSlice(alloc, "error: URL too long") catch {};
+        return;
+    };
+
     const result = std.process.Child.run(.{
         .allocator = alloc,
         .argv = &.{ "curl", "-sf", "--max-time", "30", url },
