@@ -11,6 +11,7 @@ const TrigramIndex = @import("index.zig").TrigramIndex;
 const index_mod = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry = @import("telemetry.zig");
+const root_policy = @import("root_policy.zig");
 
 
 /// Thin wrapper: format + write to a File via allocator.
@@ -73,6 +74,12 @@ pub fn main() !void {
         });
         std.process.exit(1);
     };
+    if (!root_policy.isIndexableRoot(abs_root)) {
+        out.p("{s}\xe2\x9c\x97{s} refusing to index temporary root: {s}{s}{s}\n", .{
+            s.red, s.reset, s.bold, abs_root, s.reset,
+        });
+        std.process.exit(1);
+    }
 
     const data_dir = try getDataDir(allocator, abs_root);
     defer allocator.free(data_dir);

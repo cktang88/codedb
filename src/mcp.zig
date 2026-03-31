@@ -17,6 +17,7 @@ const edit_mod = @import("edit.zig");
 const idx = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
+const root_policy = @import("root_policy.zig");
 // ── Project cache ────────────────────────────────────────────────────────────
 
 const ProjectCtx = struct {
@@ -69,6 +70,8 @@ const ProjectCache = struct {
         const p = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store };
         if (std.mem.eql(u8, p, self.default_path))
             return ProjectCtx{ .explorer = default_exp, .store = default_store };
+        if (!root_policy.isIndexableRoot(p))
+            return error.PathNotAllowed;
 
         self.mu.lock();
         defer self.mu.unlock();
@@ -1099,6 +1102,11 @@ fn handleIndex(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         out.appendSlice(alloc, path) catch {};
         return;
     };
+    if (!root_policy.isIndexableRoot(abs_path)) {
+        out.appendSlice(alloc, "error: refusing to index temporary root: ") catch {};
+        out.appendSlice(alloc, abs_path) catch {};
+        return;
+    }
 
     // Verify it's a directory
     var check_dir = std.fs.cwd().openDir(abs_path, .{}) catch {
