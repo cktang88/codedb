@@ -196,16 +196,15 @@ codedb returns structured, relevant results — not raw line dumps. For AI agent
 
 codedb builds **all** indexes on startup (outlines, trigram, word, dependency graph) — not just a parse tree:
 
-| Repo | Cold start (no cache) | Per file | Per 1k lines |
-|------|----------------------|----------|-------------|
-| codedb2 (20 files, 12.6k lines) | **17 ms** | 0.85 ms | 1.35 ms |
-| merjs (24 files, 4k lines) | **16 ms** | 0.69 ms | 4.05 ms |
+| Repo | Files | Lines | Cold start | Per file |
+|------|-------|-------|-----------|----------|
+| codedb2 | 20 | 12.6k | **17 ms** | 0.85 ms |
+| merjs | 100 | 17.3k | **16 ms** | 0.16 ms |
+| [openclaw/openclaw](https://github.com/openclaw/openclaw) | 11,677 | 1.67M | **20.3 s** | 1.74 ms |
+| [vitessio/vitess](https://github.com/vitessio/vitess) | 6,147 | 1.80M | **11.6 s** | 1.89 ms |
 
-| Mode | codedb2 | Notes |
-|------|---------|-------|
-| MCP cold start (no snapshot) | **17 ms** | Process start → MCP ready, full index built |
-| CLI cold start (`codedb tree`) | **70 ms** | Includes process startup overhead |
-| ast-grep full parse | **4 ms** | Parse only, no persistent index |
+Indexes are built once on startup. After that, the file watcher keeps them updated incrementally (single-file re-index: **<2ms**). Queries never re-scan the filesystem.
+
 
 ### Why codedb is fast
 
