@@ -157,46 +157,68 @@ curl "localhost:7719/changes?since=42"
 
 ## 📊 Benchmarks
 
-Measured on Apple M4 Pro, 48GB RAM. MCP server pre-indexed, warm queries averaged over 20 iterations.
+Measured on Apple M4 Pro, 48GB RAM. MCP = pre-indexed warm queries (20 iterations avg). CLI/external tools include process startup (3 iterations avg). Ground truth verified against Python reference implementation.
 
-### codedb (MCP) vs ast-grep vs ripgrep
+### Latency — codedb MCP vs codedb CLI vs ast-grep vs ripgrep vs grep
 
 **codedb2 repo** (20 files, 12.6k lines):
 
-| Query | codedb (MCP) | ast-grep | ripgrep | Speedup |
-|-------|-------------|----------|---------|---------|
-| File tree | **0.03 ms** | 3.7 ms | — | **123x** |
-| Symbol search (`init`) | **0.03 ms** | 3.2 ms | 7.2 ms | **107x** vs ast-grep |
-| Full-text search (`allocator`) | **0.04 ms** | 3.2 ms | 6.2 ms | **80x** vs ast-grep |
-| Word index (`self`) | **0.05 ms** | n/a | 6.7 ms | **134x** vs ripgrep |
-| Structural outline | **0.06 ms** | 3.3 ms | — | **55x** |
-| Dependency graph | **0.06 ms** | n/a | n/a | ∞ (unique) |
+| Query | codedb MCP | codedb CLI | ast-grep | ripgrep | grep | MCP speedup |
+|-------|-----------|-----------|----------|---------|------|-------------|
+| File tree | **0.04 ms** | 52.9 ms | — | — | — | **1,253x** vs CLI |
+| Symbol search (`init`) | **0.10 ms** | 54.1 ms | 3.2 ms | 6.3 ms | 6.5 ms | **549x** vs CLI |
+| Full-text search (`allocator`) | **0.05 ms** | 60.7 ms | 3.2 ms | 5.3 ms | 6.6 ms | **1,340x** vs CLI |
+| Word index (`self`) | **0.04 ms** | 59.7 ms | n/a | 7.2 ms | 6.5 ms | **1,404x** vs CLI |
+| Structural outline | **0.05 ms** | 53.5 ms | 3.1 ms | — | 2.4 ms | **1,143x** vs CLI |
+| Dependency graph | **0.05 ms** | 2.2 ms | n/a | n/a | n/a | **45x** vs CLI |
 
 **merjs repo** (100 files, 17.3k lines):
 
-| Query | codedb (MCP) | ast-grep | ripgrep | Speedup |
-|-------|-------------|----------|---------|---------|
-| File tree | **0.06 ms** | 5.5 ms | — | **92x** |
-| Symbol search (`init`) | **0.05 ms** | 3.7 ms | 5.9 ms | **74x** vs ast-grep |
-| Full-text search (`allocator`) | **0.04 ms** | 3.2 ms | 6.1 ms | **80x** vs ast-grep |
-| Word index (`self`) | **0.04 ms** | n/a | 5.1 ms | **128x** vs ripgrep |
-| Structural outline | **0.06 ms** | 2.9 ms | — | **48x** |
-| Dependency graph | **0.06 ms** | n/a | n/a | ∞ (unique) |
+| Query | codedb MCP | codedb CLI | ast-grep | ripgrep | grep | MCP speedup |
+|-------|-----------|-----------|----------|---------|------|-------------|
+| File tree | **0.05 ms** | 54.0 ms | — | — | — | **1,173x** vs CLI |
+| Symbol search (`init`) | **0.07 ms** | 54.4 ms | 3.4 ms | 6.3 ms | 3.6 ms | **758x** vs CLI |
+| Full-text search (`allocator`) | **0.03 ms** | 54.1 ms | 2.9 ms | 5.1 ms | 3.7 ms | **1,554x** vs CLI |
+| Word index (`self`) | **0.04 ms** | 54.7 ms | n/a | 6.3 ms | 4.2 ms | **1,518x** vs CLI |
+| Structural outline | **0.04 ms** | 54.9 ms | 3.4 ms | — | 2.5 ms | **1,243x** vs CLI |
+| Dependency graph | **0.05 ms** | 1.9 ms | n/a | n/a | n/a | **41x** vs CLI |
 
 ### Token Efficiency
 
 codedb returns structured, relevant results — not raw line dumps. For AI agents, this means dramatically fewer tokens per query:
 
-| Repo | codedb | ripgrep | Reduction |
-|------|--------|---------|-----------|
-| codedb2 (search `allocator`) | ~20 tokens | ~31,288 tokens | **1,564x fewer** |
-| merjs (search `allocator`) | ~20 tokens | ~3,873 tokens | **194x fewer** |
+| Repo | codedb MCP | ripgrep / grep | Reduction |
+|------|-----------|---------------|-----------|
+| codedb2 (search `allocator`) | ~20 tokens | ~32,564 tokens | **1,628x fewer** |
+| merjs (search `allocator`) | ~20 tokens | ~4,007 tokens | **200x fewer** |
 
 ### Why codedb is fast
 
-- **Pre-indexed**: MCP server indexes on startup, queries hit in-memory data structures
-- **ast-grep/ripgrep**: re-parse or re-scan the filesystem on every call
-- **codedb queries are O(1)**: hash lookups, not tree walks or file scans
+- **MCP server** indexes once on startup → all queries hit in-memory data structures (O(1) hash lookups)
+- **CLI** pays ~55ms process startup + full filesystem scan on every invocation
+- **ast-grep** re-parses all files through tree-sitter on every call (~3ms)
+- **ripgrep/grep** brute-force scan every file on every call (~5-7ms)
+- The MCP advantage: **index once, query thousands of times at sub-millisecond latency**
+
+### Feature Matrix
+
+| Feature | codedb MCP | codedb CLI | ast-grep | ripgrep | grep | ctags |
+|---------|-----------|-----------|----------|---------|------|-------|
+| Structural parsing | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Trigram search index | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Inverted word index | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Dependency graph | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Version tracking | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Multi-agent locking | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Pre-indexed (warm) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| No process startup | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| MCP protocol | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Full-text search | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Atomic file edits | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| File watcher | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+> **codedb = tree-sitter + search index + dependency graph + agent runtime.** Zero external dependencies. Pure Zig. Single binary.
+
 
 ---
 
