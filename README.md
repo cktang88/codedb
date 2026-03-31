@@ -192,6 +192,21 @@ codedb returns structured, relevant results — not raw line dumps. For AI agent
 | codedb2 (search `allocator`) | ~20 tokens | ~32,564 tokens | **1,628x fewer** |
 | merjs (search `allocator`) | ~20 tokens | ~4,007 tokens | **200x fewer** |
 
+### Indexing Speed
+
+codedb builds **all** indexes on startup (outlines, trigram, word, dependency graph) — not just a parse tree:
+
+| Repo | Cold start (no cache) | Per file | Per 1k lines |
+|------|----------------------|----------|-------------|
+| codedb2 (20 files, 12.6k lines) | **17 ms** | 0.85 ms | 1.35 ms |
+| merjs (24 files, 4k lines) | **16 ms** | 0.69 ms | 4.05 ms |
+
+| Mode | codedb2 | Notes |
+|------|---------|-------|
+| MCP cold start (no snapshot) | **17 ms** | Process start → MCP ready, full index built |
+| CLI cold start (`codedb tree`) | **70 ms** | Includes process startup overhead |
+| ast-grep full parse | **4 ms** | Parse only, no persistent index |
+
 ### Why codedb is fast
 
 - **MCP server** indexes once on startup → all queries hit in-memory data structures (O(1) hash lookups)

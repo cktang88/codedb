@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """codedb MCP vs codedb CLI vs ast-grep vs ripgrep vs grep — with ground truth verification."""
-import subprocess, json, time, sys, os, select
+import subprocess, json, time, sys, os, select, re
 
 CODEDB = "./zig-out/bin/codedb"
 REPOS = [
@@ -26,7 +26,7 @@ class McpClient:
 
     def _send(self, obj):
         body = json.dumps(obj)
-        msg = f"Content-Length: {len(body)}\r\n\r\n{body}"
+        msg = body + "\n"
         self.proc.stdin.write(msg.encode())
         self.proc.stdin.flush()
 
@@ -37,29 +37,23 @@ class McpClient:
                 chunk = os.read(self.proc.stdout.fileno(), 65536)
                 if chunk:
                     self.buf += chunk
+            # Try to find a complete JSON line
             text = self.buf.decode(errors="replace")
-            while text.startswith("Content-Length:"):
-                nl = text.find("\r\n\r\n")
-                if nl == -1: break
-                text = text[nl+4:]
-                self.buf = text.encode()
-            start = text.find("{")
-            if start == -1: continue
-            depth = 0; in_str = False; esc = False
-            for i in range(start, len(text)):
-                c = text[i]
-                if esc: esc = False; continue
-                if c == "\\": esc = True; continue
-                if c == '"': in_str = not in_str; continue
-                if in_str: continue
-                if c == "{": depth += 1
-                elif c == "}":
-                    depth -= 1
-                    if depth == 0:
-                        obj_text = text[start:i+1]
-                        self.buf = text[i+1:].encode()
-                        try: return json.loads(obj_text)
-                        except json.JSONDecodeError: continue
+            while "\n" in text:
+                line, rest = text.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    text = rest
+                    self.buf = rest.encode()
+                    continue
+                try:
+                    obj = json.loads(line)
+                    self.buf = rest.encode()
+                    return obj
+                except json.JSONDecodeError:
+                    text = rest
+                    self.buf = rest.encode()
+                    continue
         return None
 
     def _init(self):
@@ -211,8 +205,14 @@ for repo, name, desc in REPOS:
     # codedb MCP
     ms = time_mcp(client, "codedb_symbol", {"name": "init"})
     resp = client.call("codedb_symbol", {"name": "init"})
-    resp_text = json.dumps(resp) if resp else ""
-    mcp_found = resp_text.count('"line"') if resp_text else 0
+    resp_text = ""
+    mcp_found = 0
+    if resp and "result" in resp and "content" in resp["result"]:
+        for item in resp["result"]["content"]:
+            if item.get("type") == "text":
+                resp_text += item["text"]
+        # Count result lines like "src/file.zig:28 (function)"
+        mcp_found = len([l for l in resp_text.split('\n') if '(function)' in l or '(type)' in l or '(field)' in l or '(constant)' in l])
     ok = mcp_found > 0 if gt_count > 0 else mcp_found == 0
     total_tests += 1; verified += ok
     print(f"     {G}codedb MCP{N}   {W}{ms:>8.2f} ms{N}  found:{mcp_found}  {PASS if ok else FAIL}")
@@ -340,10 +340,15 @@ for repo, name, desc in REPOS:
 
     ms = time_mcp(client, "codedb_outline", {"path": first_zig})
     resp = client.call("codedb_outline", {"path": first_zig})
-    resp_text = json.dumps(resp) if resp else ""
+    resp_text = ""
+    mcp_syms = 0
+    if resp and "result" in resp and "content" in resp["result"]:
+        for item in resp["result"]["content"]:
+            if item.get("type") == "text":
+                resp_text += item["text"]
+        # Count outline entries like "  L1: import std" or "  L25: test_decl ..."
+        mcp_syms = len(re.findall(r'^\s+L\d+:', resp_text, re.MULTILINE))
     results["outline_mcp"] = ms
-    # Count symbols in response
-    mcp_syms = resp_text.count('"kind"') if resp_text else 0
     print(f"     {G}codedb MCP{N}   {W}{ms:>8.2f} ms{N}  symbols:{mcp_syms}  {PASS if mcp_syms > 0 else FAIL}")
     total_tests += 1; verified += (mcp_syms > 0)
 
