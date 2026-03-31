@@ -16,3 +16,4 @@ Thumbs.db
 .vscode/
 .idea/
 *.code-workspace
+install/.wrangler/
