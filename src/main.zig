@@ -25,7 +25,22 @@ const Out = struct {
     }
 };
 
+/// The real entry point.  Zig may merge all command-branch stack frames into
+/// one, producing a ~33 MB frame that overflows the default 16 MB OS stack.
+/// We trampoline through a thread with an explicit 64 MB stack.
 pub fn main() !void {
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, mainInner, .{});
+    thread.join();
+}
+
+fn mainInner() void {
+    mainImpl() catch |err| {
+        std.debug.print("fatal: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
+fn mainImpl() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
