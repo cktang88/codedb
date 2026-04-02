@@ -451,7 +451,7 @@ fn shouldSkipFile(path: []const u8) bool {
 /// Check if a path refers to a sensitive file (secrets, keys, credentials).
 /// Replicates the filter from snapshot.zig so live indexing and snapshots
 /// apply the same exclusion rules. Optimized: basename check + early exit.
-fn isSensitivePath(path: []const u8) bool {
+pub fn isSensitivePath(path: []const u8) bool {
     const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
     // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
     // or match sensitive patterns. Skip the full check for common cases.

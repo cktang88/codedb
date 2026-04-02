@@ -812,6 +812,10 @@ fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         out.appendSlice(alloc, "error: path traversal not allowed") catch {};
         return;
     }
+    if (watcher.isSensitivePath(path)) {
+        out.appendSlice(alloc, "error: access to sensitive file blocked") catch {};
+        return;
+    }
     // Try indexed content first (faster, consistent with indexed view)
     const cached = explorer.getContent(path, alloc) catch {
         out.appendSlice(alloc, "error: read failed") catch {};
@@ -879,6 +883,10 @@ fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     };
     if (!isPathSafe(path)) {
         out.appendSlice(alloc, "error: path traversal not allowed") catch {};
+        return;
+    }
+    if (watcher.isSensitivePath(path)) {
+        out.appendSlice(alloc, "error: access to sensitive file blocked") catch {};
         return;
     }
     const op_str = getStr(args, "op") orelse "replace";
@@ -1054,6 +1062,32 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.appendSlice(alloc, "error: missing 'action' (tree, outline, search, meta)") catch {};
         return;
     };
+    // Validate action against whitelist to prevent SSRF/path injection
+    const valid_actions = [_][]const u8{ "tree", "outline", "search", "meta" };
+    var action_valid = false;
+    for (valid_actions) |va| {
+        if (std.mem.eql(u8, action, va)) { action_valid = true; break; }
+    }
+    if (!action_valid) {
+        out.appendSlice(alloc, "error: invalid action, must be one of: tree, outline, search, meta") catch {};
+        return;
+    }
+
+    // Validate repo format: must be "owner/name" with no path traversal
+    if (std.mem.indexOf(u8, repo, "..") != null or
+        std.mem.indexOf(u8, repo, "//") != null or
+        repo[0] == '/' or
+        std.mem.indexOfScalar(u8, repo, '/') == null)
+    {
+        out.appendSlice(alloc, "error: invalid repo format, use owner/repo (e.g. justrach/merjs)") catch {};
+        return;
+    }
+    // Ensure exactly one slash (owner/repo, not owner/repo/extra/path)
+    const slash_pos = std.mem.indexOfScalar(u8, repo, '/').?;
+    if (std.mem.indexOfScalarPos(u8, repo, slash_pos + 1, '/') != null) {
+        out.appendSlice(alloc, "error: invalid repo format, use owner/repo (e.g. justrach/merjs)") catch {};
+        return;
+    }
 
     // Build URL and curl args
     var url_buf: [512]u8 = undefined;

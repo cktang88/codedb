@@ -4086,3 +4086,31 @@ test "issue-107: codedb_deps returns results for Python files" {
     try testing.expect(deps.len == 1);
     try testing.expectEqualStrings("consumer.py", deps[0]);
 }
+
+test "issue-93: isSensitivePath blocks .env and credentials" {
+    try testing.expect(watcher.isSensitivePath(".env"));
+    try testing.expect(watcher.isSensitivePath(".env.local"));
+    try testing.expect(watcher.isSensitivePath(".env.production"));
+    try testing.expect(watcher.isSensitivePath("credentials.json"));
+    try testing.expect(watcher.isSensitivePath("service-account.json"));
+    try testing.expect(watcher.isSensitivePath("id_rsa"));
+    try testing.expect(watcher.isSensitivePath("secrets.yaml"));
+    try testing.expect(watcher.isSensitivePath("config/secrets.yml"));
+    try testing.expect(watcher.isSensitivePath("server.key"));
+    try testing.expect(watcher.isSensitivePath("cert.pem"));
+    try testing.expect(watcher.isSensitivePath(".ssh/known_hosts"));
+    // Normal files should NOT be blocked
+    try testing.expect(!watcher.isSensitivePath("main.zig"));
+    try testing.expect(!watcher.isSensitivePath("src/server.zig"));
+    try testing.expect(!watcher.isSensitivePath("README.md"));
+    try testing.expect(!watcher.isSensitivePath("package.json"));
+}
+
+test "issue-93: isPathSafe blocks traversal" {
+    const MCP = @import("mcp.zig");
+    try testing.expect(!MCP.isPathSafe("../../../etc/passwd"));
+    try testing.expect(!MCP.isPathSafe("/etc/passwd"));
+    try testing.expect(!MCP.isPathSafe(""));
+    try testing.expect(MCP.isPathSafe("src/main.zig"));
+    try testing.expect(MCP.isPathSafe("README.md"));
+}
