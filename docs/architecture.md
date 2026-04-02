@@ -119,23 +119,26 @@ Thread-per-connection HTTP server on `:7719`. Parses raw HTTP/1.1 requests.
 
 JSON-RPC 2.0 over stdio with Content-Length framing. Implements the Model Context Protocol for LLM tool use.
 
-**Tools exposed:**
+**Tools exposed (16):**
 
 | Tool | Description |
 |------|-------------|
 | `codedb_tree` | File tree |
 | `codedb_outline` | File outline |
 | `codedb_symbol` | Symbol lookup |
-| `codedb_search` | Full-text search |
+| `codedb_search` | Full-text search (trigram, regex, scoped) |
 | `codedb_word` | Word index lookup |
 | `codedb_hot` | Hot files |
 | `codedb_deps` | Reverse dependencies |
-| `codedb_read` | Read file content |
-| `codedb_edit` | Apply edits |
+| `codedb_read` | Read file content (line ranges, hash caching) |
+| `codedb_edit` | Apply edits (replace, insert, delete) |
 | `codedb_changes` | Changes since seq |
 | `codedb_status` | Index status |
 | `codedb_snapshot` | Full snapshot |
-
+| `codedb_bundle` | Batch multiple queries (max 20 ops) |
+| `codedb_remote` | Query GitHub repos via codedb.codegraff.com |
+| `codedb_projects` | List locally indexed projects |
+| `codedb_index` | Index a local folder |
 **Safety:** path validation, oversized message handling (drains >1MB lines instead of killing the loop).
 
 ### `edit.zig` — File Editor

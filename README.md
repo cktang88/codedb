@@ -110,22 +110,68 @@ codedb hot                            # recently modified files
 
 ## 🔧 MCP Tools
 
-12 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+16 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
 
 | Tool | Description |
 |------|-------------|
 | `codedb_tree` | Full file tree with language, line counts, symbol counts |
 | `codedb_outline` | Symbols in a file: functions, structs, imports, with line numbers |
 | `codedb_symbol` | Find where a symbol is defined across the codebase |
-| `codedb_search` | Trigram-accelerated full-text search |
+| `codedb_search` | Trigram-accelerated full-text search (supports regex, scoped results) |
 | `codedb_word` | O(1) inverted index word lookup |
 | `codedb_hot` | Most recently modified files |
 | `codedb_deps` | Reverse dependency graph (which files import this file) |
-| `codedb_read` | Read file content |
-| `codedb_edit` | Apply line-range edits (atomic writes) |
+| `codedb_read` | Read file content (supports line ranges, hash-based caching) |
+| `codedb_edit` | Apply line-range edits (replace, insert, delete — atomic writes) |
 | `codedb_changes` | Changed files since a sequence number |
 | `codedb_status` | Index status (file count, current sequence) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |
+| `codedb_bundle` | Batch multiple read-only queries in one call (max 20 ops) |
+| `codedb_remote` | Query any GitHub repo via cloud intelligence — no local clone needed |
+| `codedb_projects` | List all locally indexed projects on this machine |
+| `codedb_index` | Index a local folder and create a codedb.snapshot |
+
+
+### `codedb_remote` — Cloud Intelligence
+
+Query any public GitHub repo without cloning it. Powered by `codedb.codegraff.com`.
+
+```
+# Get the file tree of an external repo
+codedb_remote repo="vercel/next.js" action="tree"
+
+# Search for code in a dependency
+codedb_remote repo="justrach/merjs" action="search" query="handleRequest"
+
+# Get symbol outlines
+codedb_remote repo="justrach/merjs" action="outline"
+
+# Get repo metadata
+codedb_remote repo="justrach/merjs" action="meta"
+```
+
+**Actions:** `tree`, `outline`, `search`, `meta`
+
+**Note:** This tool calls `codedb.codegraff.com` via HTTPS. No API key required. The service must be available for this tool to work.
+
+### CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `codedb tree` | Show file tree with language and symbol counts |
+| `codedb outline <path>` | List all symbols in a file |
+| `codedb find <name>` | Find where a symbol is defined |
+| `codedb search <query>` | Full-text search (trigram, case-insensitive) |
+| `codedb search --regex <pattern>` | Regex search |
+| `codedb word <identifier>` | Exact word lookup via inverted index |
+| `codedb hot` | Recently modified files |
+| `codedb snapshot` | Write codedb.snapshot to project root |
+| `codedb serve` | HTTP daemon on :7719 |
+| `codedb mcp [path]` | JSON-RPC/MCP server over stdio |
+| `codedb update` | Self-update via install script |
+| `codedb --version` | Print version |
+
+**Options:** `--no-telemetry` (or set `CODEDB_NO_TELEMETRY` env var)
 
 ### Example: agent explores a codebase
 
