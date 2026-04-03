@@ -139,6 +139,7 @@ fn mainImpl() !void {
     };
 
     var explorer = Explorer.init(allocator);
+    explorer.setRoot(root);
     defer explorer.deinit();
 
     // Per-project frequency table for sparse n-gram boundary selection.
@@ -656,6 +657,11 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
+                const fc = explorer.outlines.count();
+                if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+                    explorer.releaseContents();
+                    explorer.releaseSecondaryIndexes();
+                }
                 return;
             }
         }
@@ -663,17 +669,33 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         explorer.rebuildTrigrams() catch {};
     }
 
-    // Persist trigram index to disk for fast future startup
     explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
         std.log.warn("could not persist trigram index: {}", .{err});
     };
+
+    // Compact: free the scan-time trigram (fragmented) and reload from disk (dense).
+    // This reclaims allocator fragmentation from incremental index building.
+    if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = loaded;
+        explorer.mu.unlock();
+    }
+
     scan_done.store(true, .release);
     telem.recordCodebaseStats(explorer, @intCast(@max(std.time.milliTimestamp() - startup_t0, 0)));
 
-    // Auto-write snapshot after successful scan
     snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
+    // Only release contents for large repos where memory savings matter.
+    // Small repos keep content in RAM for faster search.
+    const file_count = explorer.outlines.count();
+    if (file_count > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+        explorer.releaseContents();
+        explorer.releaseSecondaryIndexes();
+    }
+}
 }
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
