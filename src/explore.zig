@@ -174,11 +174,11 @@ pub const Explorer = struct {
 
     /// Release word and sparse indexes to free memory on large repos.
     /// Word search falls back to content search, sparse is a secondary filter.
+    /// Release sparse ngram index to free memory on large repos.
+    /// Trigram index alone provides sufficient candidate filtering for search.
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        self.word_index.deinit();
-        self.word_index = WordIndex.init(self.allocator);
         self.sparse_ngram_index.deinit();
         self.sparse_ngram_index = SparseNgramIndex.init(self.allocator);
     }

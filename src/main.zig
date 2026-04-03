@@ -667,6 +667,8 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
         }
         // File count mismatch or disk read failed — rebuild trigrams from stored content
         explorer.rebuildTrigrams() catch {};
+    }
+
     explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
         std.log.warn("could not persist trigram index: {}", .{err});
     };
