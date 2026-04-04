@@ -549,7 +549,6 @@ fn mainImpl() !void {
         if (scan_thread) |st| st.join();
         watch_thread.join();
         idle_thread.join();
-        if (scan_thread) |t| t.join();
 
         // Clean up PID lock
         std.fs.cwd().deleteFile(pid_path) catch {};
