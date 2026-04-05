@@ -225,13 +225,13 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
             }
         }
 
-        // Track Ruby =begin/=end block comments
+        // Track Ruby =begin/=end block comments (must be at column 0 per Ruby spec)
         if (outline.language == .ruby) {
-            if (in_py_docstring) { // reuse the flag for ruby =begin/=end
-                if (std.mem.eql(u8, trimmed, "=end")) in_py_docstring = false;
+            if (in_py_docstring) {
+                if (startsWith(line, "=end")) in_py_docstring = false;
                 continue;
             }
-            if (std.mem.eql(u8, trimmed, "=begin")) { in_py_docstring = true; continue; }
+            if (startsWith(line, "=begin")) { in_py_docstring = true; continue; }
         }
 
         // Track JS/TS block comments (#113)
@@ -1501,6 +1501,8 @@ fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !voi
     errdefer deps.deinit(self.allocator);
 
     for (outline.imports.items) |imp| {
+        // Skip imports with path traversal sequences
+        if (std.mem.indexOf(u8, imp, "..") != null) continue;
         try deps.append(self.allocator, imp);
     }
 
@@ -2084,8 +2086,10 @@ fn startsWith(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn extractIdent(s: []const u8) ?[]const u8 {
+    const max_ident_len: usize = 256;
     var end: usize = 0;
     for (s) |ch| {
+        if (end >= max_ident_len) break;
         if (std.ascii.isAlphanumeric(ch) or ch == '_') {
             end += 1;
         } else break;
