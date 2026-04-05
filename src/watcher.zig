@@ -184,6 +184,20 @@ const FilteredWalker = struct {
             }
         } else |_| {}
 
+        // Also load .gitignore patterns (respect git's ignore rules)
+        if (root.readFileAlloc(allocator, ".gitignore", 64 * 1024)) |content| {
+            defer allocator.free(content);
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0 or trimmed[0] == '#') continue;
+                // Skip negation patterns (!) — too complex for simple matching
+                if (trimmed[0] == '!') continue;
+                const duped = try allocator.dupe(u8, trimmed);
+                try self.ignore_patterns.append(allocator, duped);
+            }
+        } else |_| {}
+
         return self;
     }
 
