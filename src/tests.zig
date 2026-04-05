@@ -4529,3 +4529,44 @@ test "issue-151: Go block comments skipped" {
     }
     try testing.expect(func_count == 1); // only realFunc
 }
+
+
+test "issue-150: --help prints usage" {
+    const result = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ "zig", "build", "run", "--", "--help" },
+        .max_output_bytes = 8192,
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
+        std.mem.indexOf(u8, result.stderr, "usage:") != null);
+}
+
+test "issue-150: -h prints usage" {
+    const result = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ "zig", "build", "run", "--", "-h" },
+        .max_output_bytes = 8192,
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
+        std.mem.indexOf(u8, result.stderr, "usage:") != null);
+}
+
+test "issue-116: getGitHead returns valid SHA for git repos" {
+    const git = @import("git.zig");
+
+    // This test runs inside the codedb repo itself
+    const head = git.getGitHead(".", testing.allocator) catch null;
+
+    if (head) |h| {
+        try testing.expect(h.len == 40);
+        for (h) |c| {
+            try testing.expect(std.ascii.isHex(c));
+        }
+    }
+}

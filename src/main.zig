@@ -91,6 +91,12 @@ fn mainImpl() !void {
         return;
     }
 
+    // Handle --help early (no root needed)
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
+        printUsage(out, s);
+        return;
+    }
+
     // Handle update command (re-runs the install script)
     if (std.mem.eql(u8, cmd, "update")) {
         out.p("updating codedb...\n", .{});
